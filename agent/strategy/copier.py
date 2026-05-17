@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 
 from ..ai.analyst import AIAnalyst, CopyDecision
 from ..config import Settings
-from ..db.models import TradeLog
+from ..db.models import TradeLog, Wallet
 from ..executor.base import BaseExecutor, TradeRequest
 from ..polymarket.clob import ClobClient
 from ..polymarket.gamma import GammaClient
+from ..scanner.domain_scorer import DomainScorer
 from .risk import RiskManager
 
 log = logging.getLogger(__name__)
@@ -48,6 +50,9 @@ class CopyTrader:
         self._session_factory = session_factory
         self.active_wallets = active_wallets
         self._wallets_lock = asyncio.Lock()
+        self._domain_scorer = DomainScorer(gamma)
+        # In-memory cache: address → {category: win_rate} loaded from DB
+        self._domain_cache: dict[str, dict[str, float]] = {}
 
     async def update_active_wallets(self, new_wallets: list[str]) -> None:
         """Thread-safe replacement of the active wallet set."""
@@ -79,7 +84,10 @@ class CopyTrader:
             wallet[:10], signal.side, signal.order_size_usdc, signal.price, signal.market_id[:20],
         )
 
-        raw_size = signal.order_size_usdc * self._settings.copy_scale
+        # Domain-based scale adjustment: boost for wallet's strong categories
+        domain_multiplier = await self._domain_multiplier(wallet, signal.market_id)
+
+        raw_size = signal.order_size_usdc * self._settings.copy_scale * domain_multiplier
         scale_override = 1.0
         ai_reason = "no AI"
 
@@ -132,6 +140,43 @@ class CopyTrader:
             )
         else:
             log.warning("Executor failed: %s", result.error)
+
+    def update_domain_cache(self, address: str, domain_scores: dict[str, float]) -> None:
+        """Called by the scan loop after computing domain scores."""
+        self._domain_cache[address.lower()] = domain_scores
+
+    async def _domain_multiplier(self, wallet: str, market_id: str) -> float:
+        """Return copy_scale multiplier based on wallet's domain expertise for this market."""
+        try:
+            domain_scores = self._domain_cache.get(wallet)
+            if domain_scores is None:
+                # Try loading from DB once
+                from sqlalchemy import select as _sel
+                async with self._session_factory() as session:
+                    row = (await session.execute(
+                        _sel(Wallet.domain_scores).where(Wallet.address == wallet)
+                    )).scalar_one_or_none()
+                domain_scores = json.loads(row or "{}") if row else {}
+                self._domain_cache[wallet] = domain_scores
+
+            if not domain_scores:
+                return 1.0
+
+            market = await self._gamma.get_market(market_id)
+            if not market:
+                return 1.0
+
+            multiplier = self._domain_scorer.copy_scale_multiplier(
+                domain_scores, market.normalized_category
+            )
+            if multiplier != 1.0:
+                log.info(
+                    "[Domain] %s category=%s → scale ×%.1f",
+                    wallet[:10], market.normalized_category, multiplier,
+                )
+            return multiplier
+        except Exception:
+            return 1.0
 
     async def _log_skip(self, signal: CopySignal, reason: str) -> None:
         async with self._session_factory() as session:

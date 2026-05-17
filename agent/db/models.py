@@ -28,6 +28,8 @@ class Wallet(Base):
     is_bot_likely: Mapped[bool] = mapped_column(default=False)
     bot_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     is_active: Mapped[bool] = mapped_column(default=True)
+    domain_scores: Mapped[str] = mapped_column(Text, default="{}")   # JSON {category: win_rate}
+    discovery_source: Mapped[str] = mapped_column(String(20), default="leaderboard")  # leaderboard | onchain | resolution | copycat
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

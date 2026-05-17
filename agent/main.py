@@ -25,8 +25,10 @@ from .polymarket.data import DataClient
 from .polymarket.gamma import GammaClient
 from .scanner.analyzer import WalletAnalyzer
 from .scanner.detector import BotDetector
+from .scanner.domain_scorer import DomainScorer
 from .scanner.leaderboard import LeaderboardFetcher
 from .scanner.onchain_scanner import OnChainScanner, RisingStarAnalyzer
+from .scanner.resolution_scanner import ResolutionScanner
 from .strategy.copier import CopyTrader
 from .strategy.risk import RiskManager
 
@@ -144,14 +146,14 @@ async def _main(
     log.info("HTTP API listening on port %d", settings.agent_http_port)
     log.info("TypeScript monitor: cd monitor-ts && npm start")
 
-    on_chain_scanner = OnChainScanner(
-        rpc_url=settings.polygon_rpc_url,
-        data_client=data,
-    )
+    on_chain_scanner = OnChainScanner(rpc_url=settings.polygon_rpc_url, data_client=data)
+    resolution_scanner = ResolutionScanner(gamma=gamma, data=data)
+    domain_scorer = DomainScorer(gamma=gamma)
 
     await asyncio.gather(
         server.serve(),
-        _scan_loop(settings, data, analyst, session_factory, copier, scan_now, on_chain_scanner),
+        _scan_loop(settings, data, analyst, session_factory, copier, scan_now, on_chain_scanner, domain_scorer),
+        _resolution_loop(settings, resolution_scanner, copier, session_factory),
         _position_manager_loop(settings, executor, clob, session_factory),
     )
 
@@ -166,6 +168,7 @@ async def _scan_loop(
     copier: CopyTrader,
     run_immediately: bool,
     on_chain_scanner: OnChainScanner,
+    domain_scorer: DomainScorer,
 ) -> None:
     log = logging.getLogger("agent.scanner")
 
@@ -178,7 +181,7 @@ async def _scan_loop(
 
     while True:
         try:
-            await _run_scan(settings, data, analyst, session_factory, copier, on_chain_scanner)
+            await _run_scan(settings, data, analyst, session_factory, copier, on_chain_scanner, domain_scorer)
         except Exception as exc:
             log.error("Scan failed: %s", exc, exc_info=True)
         await asyncio.sleep(settings.scan_interval_seconds)
@@ -197,6 +200,7 @@ async def _run_scan(
     session_factory,
     copier: CopyTrader,
     on_chain_scanner: OnChainScanner,
+    domain_scorer: DomainScorer,
 ) -> None:
     log = logging.getLogger("agent.scanner")
     log.info("Starting leaderboard scan…")
@@ -217,9 +221,11 @@ async def _run_scan(
             trades = await data.get_trader_trades(candidate.address, limit=200)
         sc = analyzer.score(candidate, trades)
         bot = detector.analyze(candidate.address, trades, candidate.profile)
-        sc.raw_metrics["bot_signals"] = bot.signals
+        domains = await domain_scorer.score(trades)
+        sc.raw_metrics["bot_signals"]   = bot.signals
         sc.raw_metrics["bot_confidence"] = bot.bot_confidence
-        sc.raw_metrics["source"] = "leaderboard"
+        sc.raw_metrics["source"]         = "leaderboard"
+        sc.raw_metrics["domain_scores"]  = domains
         return sc, bot
 
     results = await asyncio.gather(*[score_candidate(c) for c in candidates])
@@ -245,9 +251,11 @@ async def _run_scan(
                 trades = await data.get_trader_trades(candidate.address, limit=200)
             sc = rising_analyzer.score(candidate, trades)
             bot = detector.analyze(candidate.address, trades, candidate.profile)
-            sc.raw_metrics["bot_signals"] = bot.signals
+            domains = await domain_scorer.score(trades)
+            sc.raw_metrics["bot_signals"]    = bot.signals
             sc.raw_metrics["bot_confidence"] = bot.bot_confidence
-            sc.raw_metrics["source"] = "onchain"
+            sc.raw_metrics["source"]         = "onchain"
+            sc.raw_metrics["domain_scores"]  = domains
             return sc, bot
 
         rising_results = await asyncio.gather(*[score_rising(c) for c in rising_candidates])
@@ -305,10 +313,12 @@ async def _run_scan(
             w.trade_count = ws.trade_count
             w.avg_trade_size = ws.avg_trade_size
             w.trade_frequency_per_day = ws.trade_frequency_per_day
-            w.is_bot_likely = bot.is_bot_likely
-            w.bot_confidence = bot.bot_confidence
-            w.is_active = ws.address in top_addresses
-            w.last_scanned_at = datetime.utcnow()
+            w.is_bot_likely      = bot.is_bot_likely
+            w.bot_confidence     = bot.bot_confidence
+            w.is_active          = ws.address in top_addresses
+            w.domain_scores      = __import__("json").dumps(ws.raw_metrics.get("domain_scores", {}))
+            w.discovery_source   = ws.raw_metrics.get("source", "leaderboard")
+            w.last_scanned_at    = datetime.utcnow()
 
         scan_run = ScanRun(
             completed_at=datetime.utcnow(),
@@ -319,8 +329,58 @@ async def _run_scan(
         session.add(scan_run)
         await session.commit()
 
+    # Push domain scores to copier so handle_signal can apply multipliers immediately
+    for ws, _ in scored:
+        domains = ws.raw_metrics.get("domain_scores", {})
+        if domains:
+            copier.update_domain_cache(ws.address, domains)
+
     await copier.update_active_wallets(top_addresses)
     log.info("Scan complete. Monitoring %d wallets.", len(top_addresses))
+
+
+# ── Resolution scanner loop ──────────────────────────────────────────────────
+
+async def _resolution_loop(
+    settings: Settings,
+    scanner: ResolutionScanner,
+    copier: CopyTrader,
+    session_factory,
+) -> None:
+    import json as _json
+    log = logging.getLogger("agent.resolution")
+    await asyncio.sleep(60)  # give the main scan time to complete first
+
+    while True:
+        try:
+            async with copier._wallets_lock:
+                known = set(copier.active_wallets)
+            candidates = await scanner.scan(known_addresses=known)
+
+            for candidate in candidates:
+                added = await copier.add_wallet(candidate.address)
+                if added:
+                    log.info(
+                        "[Resolution] Activated %s — correctly called a resolved market",
+                        candidate.address[:10],
+                    )
+                    async with session_factory() as session:
+                        from .db.models import Wallet
+                        from sqlalchemy import select as _sel
+                        existing = (
+                            await session.execute(_sel(Wallet).where(Wallet.address == candidate.address))
+                        ).scalar_one_or_none()
+                        w = existing or Wallet(address=candidate.address)
+                        if not existing:
+                            session.add(w)
+                        w.is_active        = True
+                        w.discovery_source = "resolution"
+                        w.last_scanned_at  = datetime.utcnow()
+                        await session.commit()
+        except Exception as exc:
+            log.error("[Resolution] Loop error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(300)  # check every 5 minutes
 
 
 # ── Position manager loop ─────────────────────────────────────────────────────

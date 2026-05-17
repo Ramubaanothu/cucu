@@ -7,6 +7,7 @@ import axios from "axios";
 import { HotWalletAlert, OnChainActivity, OnChainTrade } from "./types";
 import { OnChainWatcher } from "./onchain";
 import { HotWalletTracker } from "./hot_tracker";
+import { CopycatDetector } from "./copycat_detector";
 import { WalletPoller, WalletWatcher } from "./watcher";
 
 const AGENT_URL = `http://localhost:${process.env.AGENT_HTTP_PORT ?? "8000"}`;
@@ -17,10 +18,11 @@ const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_SECONDS ?? "3600") *
 const POLYGON_WS_RPC =
   process.env.POLYGON_WS_RPC_URL ?? "wss://polygon-bor-rpc.publicnode.com";
 
-const poller = new WalletPoller();
-const watcher = new WalletWatcher(AGENT_URL);
-const onchain = new OnChainWatcher(POLYGON_WS_RPC);
+const poller     = new WalletPoller();
+const watcher    = new WalletWatcher(AGENT_URL);
+const onchain    = new OnChainWatcher(POLYGON_WS_RPC);
 const hotTracker = new HotWalletTracker();
+const copycat    = new CopycatDetector();
 
 const pollingTimers = new Map<string, NodeJS.Timeout>();
 
@@ -75,6 +77,27 @@ onchain.on("trade", async (trade: OnChainTrade) => {
 // Hot-wallet discovery: track ALL makers in real time
 onchain.on("activity", (activity: OnChainActivity) => {
   hotTracker.track(activity.maker, activity.sizeUsdc, activity.isBuy, activity.tokenId);
+  copycat.observe(activity.maker, activity.tokenId);
+});
+
+// Copycat source-wallet alerts: forward as hot-wallet signals (same scoring path)
+copycat.on("source-wallet", async (alert: { address: string; lead_count: number; reason: string }) => {
+  try {
+    await axios.post(`${AGENT_URL}/hot-wallet`, {
+      address:        alert.address,
+      trade_count:    alert.lead_count,
+      window_hours:   1.5,
+      buy_usdc:       0,
+      sell_usdc:      0,
+      profit_ratio:   0,
+      unique_markets: 0,
+      reason:         `copycat-source: ${alert.reason}`,
+    }, { timeout: 10_000 });
+    console.log(`[Copycat] Forwarded source-wallet ${alert.address.slice(0, 10)} to agent`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Copycat] Failed to forward: ${msg}`);
+  }
 });
 
 // Forward hot-wallet alerts to Python for immediate scoring and activation
@@ -134,6 +157,7 @@ process.on("SIGINT", () => {
   for (const a of pollingTimers.keys()) stopPolling(a);
   onchain.destroy();
   hotTracker.destroy();
+  copycat.destroy();
   process.exit(0);
 });
 

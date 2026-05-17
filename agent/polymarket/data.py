@@ -159,5 +159,19 @@ class DataClient:
         except Exception:
             return []
 
+    async def get_market_trades(
+        self, condition_id: str, limit: int = 500
+    ) -> list[TradeHistory]:
+        """Fetch all trades for a specific market by condition ID."""
+        try:
+            data = await self._get(
+                "/activity",
+                params={"conditionId": condition_id, "limit": limit},
+            )
+            items = data if isinstance(data, list) else data.get("data", [])
+            return [TradeHistory.from_dict(t) for t in items]
+        except Exception:
+            return []
+
     async def aclose(self) -> None:
         await self._client.aclose()

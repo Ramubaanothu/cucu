@@ -38,6 +38,20 @@ class MarketMeta:
             raw=d,
         )
 
+    @property
+    def winning_token_id(self) -> str | None:
+        """Return the token ID of the winning outcome, or None if not yet resolved."""
+        for t in self.tokens:
+            if t.get("winner") is True or str(t.get("winner", "")).lower() == "true":
+                return str(
+                    t.get("token_id") or t.get("tokenID") or t.get("tokenId") or ""
+                ) or None
+        return None
+
+    @property
+    def normalized_category(self) -> str:
+        return (self.category or "unknown").lower().strip() or "unknown"
+
 
 class GammaClient:
     def __init__(self) -> None:
@@ -84,6 +98,33 @@ class GammaClient:
         data = await self._get("/markets", params={"search": query, "limit": limit})
         items = data if isinstance(data, list) else data.get("data", [])
         return [MarketMeta.from_dict(m) for m in items]
+
+    async def get_resolved_markets(
+        self, since_hours: float = 6.0, limit: int = 50
+    ) -> list[MarketMeta]:
+        """Fetch markets that closed/resolved within the last since_hours hours."""
+        from datetime import datetime, timedelta, timezone
+        try:
+            data = await self._get(
+                "/markets",
+                params={"closed": "true", "limit": limit, "order": "end_date_iso", "ascending": "false"},
+            )
+            items = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+            markets = [MarketMeta.from_dict(m) for m in items]
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+            recent = []
+            for m in markets:
+                if not m.end_date:
+                    continue
+                try:
+                    end = datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
+                    if end >= cutoff:
+                        recent.append(m)
+                except Exception:
+                    pass
+            return recent
+        except Exception:
+            return []
 
     async def aclose(self) -> None:
         await self._client.aclose()
