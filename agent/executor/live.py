@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from sqlalchemy import select
@@ -11,6 +13,12 @@ from ..polymarket.clob import CLOBCredentials, ClobClient
 from .base import BaseExecutor, TradeRequest, TradeResult
 
 log = logging.getLogger(__name__)
+
+_KEY_PATTERN = re.compile(r'0x[a-fA-F0-9]{40,}')
+
+
+def _sanitize(msg: str) -> str:
+    return _KEY_PATTERN.sub("0x***", msg)
 
 
 class LiveExecutor(BaseExecutor):
@@ -23,6 +31,30 @@ class LiveExecutor(BaseExecutor):
         self._clob = clob
         self._creds = credentials
         self._session_factory = session_factory
+        self._thread_pool = ThreadPoolExecutor(max_workers=3)
+
+    async def validate_credentials(self) -> None:
+        """Call once on startup — raises if credentials are invalid."""
+        def _check():
+            try:
+                from py_clob_client.client import ClobClient as SDK
+                from py_clob_client.constants import POLYGON
+                sdk = SDK(
+                    host="https://clob.polymarket.com",
+                    key=self._creds.private_key,
+                    chain_id=POLYGON,
+                    api_key=self._creds.api_key,
+                    api_secret=self._creds.api_secret,
+                    api_passphrase=self._creds.api_passphrase,
+                )
+                # Fetch open orders as a lightweight auth test
+                sdk.get_orders()
+            except ImportError:
+                raise RuntimeError("py-clob-client not installed. Run: pip install py-clob-client")
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self._thread_pool, _check)
+        log.info("Live credentials validated successfully")
 
     async def open_position(self, req: TradeRequest) -> TradeResult:
         if req.size_usdc < 1.0:
@@ -45,17 +77,33 @@ class LiveExecutor(BaseExecutor):
         try:
             order_resp = await self._build_and_place(req, shares)
         except Exception as exc:
-            log.error("Live order failed: %s", exc)
+            safe_msg = _sanitize(str(exc))
+            log.error("Live order failed: %s", safe_msg)
             return TradeResult(
                 success=False, position_id=None,
                 executed_size=0, executed_price=0,
-                order_id=None, error=str(exc),
+                order_id=None, error=safe_msg,
                 mode="live",
             )
 
-        order_id = order_resp.get("orderID") or order_resp.get("id") or ""
-        filled_size = float(order_resp.get("filledAmount") or req.size_usdc)
-        filled_price = float(order_resp.get("fillPrice") or req.price)
+        # Normalise response field names (Polymarket SDK may vary)
+        order_id = (
+            order_resp.get("orderID")
+            or order_resp.get("order_id")
+            or order_resp.get("id")
+            or ""
+        )
+        filled_size = float(
+            order_resp.get("filledAmount")
+            or order_resp.get("size_matched")
+            or order_resp.get("filled")
+            or req.size_usdc
+        )
+        filled_price = float(
+            order_resp.get("fillPrice")
+            or order_resp.get("price")
+            or req.price
+        )
 
         async with self._session_factory() as session:
             pos = Position(
@@ -86,7 +134,7 @@ class LiveExecutor(BaseExecutor):
                 price=filled_price,
                 source_wallet=req.source_wallet,
                 reason=req.reason,
-                raw_response=str(order_resp),
+                raw_response=str({k: v for k, v in order_resp.items() if k != "key"}),
             )
             session.add(tl)
             await session.commit()
@@ -102,11 +150,11 @@ class LiveExecutor(BaseExecutor):
         )
 
     async def _build_and_place(self, req: TradeRequest, shares: float) -> dict:
-        """
-        Build and submit a FOK limit order via the py-clob-client SDK.
-        Wraps the sync SDK in asyncio.to_thread.
-        """
-        import asyncio
+        loop = asyncio.get_event_loop()
+        creds = self._creds
+        token_id = req.token_id
+        price = req.price
+        side = req.side
 
         def _sync_place():
             try:
@@ -116,17 +164,17 @@ class LiveExecutor(BaseExecutor):
 
                 sdk = SDK(
                     host="https://clob.polymarket.com",
-                    key=self._creds.private_key,
+                    key=creds.private_key,
                     chain_id=POLYGON,
-                    api_key=self._creds.api_key,
-                    api_secret=self._creds.api_secret,
-                    api_passphrase=self._creds.api_passphrase,
+                    api_key=creds.api_key,
+                    api_secret=creds.api_secret,
+                    api_passphrase=creds.api_passphrase,
                 )
                 order_args = OrderArgs(
-                    token_id=req.token_id,
-                    price=req.price,
+                    token_id=token_id,
+                    price=price,
                     size=round(shares, 2),
-                    side="BUY" if req.side == "YES" else "SELL",
+                    side="BUY" if side == "YES" else "SELL",
                 )
                 signed = sdk.create_order(order_args)
                 return sdk.post_order(signed, OrderType.FOK)
@@ -135,7 +183,7 @@ class LiveExecutor(BaseExecutor):
                     "py-clob-client not installed. Run: pip install py-clob-client"
                 )
 
-        return await asyncio.to_thread(_sync_place)
+        return await loop.run_in_executor(self._thread_pool, _sync_place)
 
     async def close_position(self, position_id: int, reason: str) -> TradeResult:
         async with self._session_factory() as session:
@@ -147,7 +195,6 @@ class LiveExecutor(BaseExecutor):
                     order_id=None, error="Position not found or already closed",
                     mode="live",
                 )
-            # Place opposing FOK order to close
             close_req = TradeRequest(
                 market_id=pos.market_id,
                 token_id=pos.token_id,
@@ -162,15 +209,17 @@ class LiveExecutor(BaseExecutor):
             try:
                 order_resp = await self._build_and_place(close_req, shares)
             except Exception as exc:
-                log.error("Live close failed: %s", exc)
+                safe_msg = _sanitize(str(exc))
+                log.error("Live close failed: %s", safe_msg)
                 return TradeResult(
                     success=False, position_id=position_id,
                     executed_size=0, executed_price=0,
-                    order_id=None, error=str(exc), mode="live",
+                    order_id=None, error=safe_msg, mode="live",
                 )
 
             pos.status = "closed"
             pos.closed_at = datetime.utcnow()
+            session.add(pos)  # explicit re-add to ensure SQLAlchemy tracks update
             tl = TradeLog(
                 position_id=pos.id, action="close", mode="live",
                 market_id=pos.market_id, token_id=pos.token_id,

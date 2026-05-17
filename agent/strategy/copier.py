@@ -46,12 +46,22 @@ class CopyTrader:
         self._clob = clob
         self._gamma = gamma
         self._session_factory = session_factory
-        self.active_wallets = active_wallets  # mutable set, updated by scanner
+        self.active_wallets = active_wallets
+        self._wallets_lock = asyncio.Lock()
+
+    async def update_active_wallets(self, new_wallets: list[str]) -> None:
+        """Thread-safe replacement of the active wallet set."""
+        async with self._wallets_lock:
+            self.active_wallets.clear()
+            self.active_wallets.update(new_wallets)
 
     async def handle_signal(self, signal: CopySignal) -> None:
         wallet = signal.source_wallet.lower()
 
-        if wallet not in self.active_wallets:
+        async with self._wallets_lock:
+            is_target = wallet in self.active_wallets
+
+        if not is_target:
             log.debug("Signal from non-target wallet %s — ignored", wallet[:10])
             return
 
@@ -60,12 +70,10 @@ class CopyTrader:
             wallet[:10], signal.side, signal.order_size_usdc, signal.price, signal.market_id[:20],
         )
 
-        # Scale copy size
         raw_size = signal.order_size_usdc * self._settings.copy_scale
         scale_override = 1.0
         ai_reason = "no AI"
 
-        # AI gate (skip if Claude not configured)
         if self._analyst and self._settings.has_claude_credentials:
             snap = await self._risk.get_exposure_snapshot()
             decision: CopyDecision = await self._analyst.assess_copy_trade(

@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-from datetime import datetime
+import re as _re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import typer
 import uvicorn
 from rich.logging import RichHandler
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from .ai.analyst import AIAnalyst
 from .api.server import build_app
 from .config import Settings
 from .db.database import create_tables, init_engine
-from .db.models import ScanRun, Wallet
+from .db.models import Position, ScanRun, TradeLog, Wallet
 from .executor.base import BaseExecutor
 from .executor.live import LiveExecutor
 from .executor.paper import PaperExecutor
@@ -67,7 +68,6 @@ async def _main(
     log = logging.getLogger("agent.main")
     log.info("Starting Polymarket copy-trading agent [mode=%s]", settings.trading_mode)
 
-    # Ensure DB directory exists
     db_dir = Path(settings.db_path).parent
     db_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,12 +75,10 @@ async def _main(
     await create_tables(engine)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    # Build API clients
     clob = ClobClient()
     gamma = GammaClient()
     data = DataClient()
 
-    # Claude analyst (optional)
     analyst: AIAnalyst | None = None
     if settings.has_claude_credentials:
         import anthropic
@@ -90,7 +88,6 @@ async def _main(
     else:
         log.warning("ANTHROPIC_API_KEY not set — AI gating disabled, using rule-based copy")
 
-    # Build executor
     executor: BaseExecutor
     if settings.trading_mode == "live":
         if not settings.has_trading_credentials:
@@ -102,27 +99,26 @@ async def _main(
             api_passphrase=settings.polymarket_api_passphrase,
             private_key=settings.polygon_private_key,
         )
-        executor = LiveExecutor(clob, creds, session_factory)
+        live_exec = LiveExecutor(clob, creds, session_factory)
+        await live_exec.validate_credentials()
+        executor = live_exec
         log.info("Live executor ready")
     else:
         executor = PaperExecutor(session_factory)
         log.info("Paper executor ready")
 
-    # Load active wallets from DB or pinned config
     active_wallets: set[str] = set()
     if settings.pinned_wallets:
         active_wallets = set(settings.pinned_wallets)
         log.info("Using %d pinned wallets", len(active_wallets))
     else:
         async with session_factory() as session:
-            from sqlalchemy import select
             result = await session.execute(
                 select(Wallet.address).where(Wallet.is_active == True)
             )
             active_wallets = {row[0] for row in result.all()}
         log.info("Loaded %d active wallets from DB", len(active_wallets))
 
-    # Build strategy components
     risk = RiskManager(settings, session_factory)
     copier = CopyTrader(
         settings=settings,
@@ -135,7 +131,6 @@ async def _main(
         active_wallets=active_wallets,
     )
 
-    # FastAPI server
     app = build_app(copier, risk, session_factory)
     server_config = uvicorn.Config(
         app,
@@ -146,15 +141,16 @@ async def _main(
     server = uvicorn.Server(server_config)
 
     log.info("HTTP API listening on port %d", settings.agent_http_port)
-    log.info(
-        "TypeScript monitor: cd monitor-ts && npm start  (polls wallets and POSTs to /copy-signal)"
-    )
+    log.info("TypeScript monitor: cd monitor-ts && npm start")
 
     await asyncio.gather(
         server.serve(),
         _scan_loop(settings, data, analyst, session_factory, copier, scan_now),
+        _position_manager_loop(settings, executor, clob, session_factory),
     )
 
+
+# ── Scanner loop ─────────────────────────────────────────────────────────────
 
 async def _scan_loop(
     settings: Settings,
@@ -168,7 +164,7 @@ async def _scan_loop(
 
     if not run_immediately:
         log.info(
-            "Scanner will run in %d seconds. Start with --scan-now to run immediately.",
+            "Scanner will run in %d seconds. Use --scan-now to run immediately.",
             settings.scan_interval_seconds,
         )
         await asyncio.sleep(settings.scan_interval_seconds)
@@ -198,50 +194,51 @@ async def _run_scan(
     candidates = await fetcher.fetch_candidates(top_n=200)
     log.info("Fetched %d candidates", len(candidates))
 
-    scored = []
-    for candidate in candidates:
-        trades = await data.get_trader_trades(candidate.address, limit=200)
-        score = analyzer.score(candidate, trades)
+    # Parallel trade fetching — 10 concurrent requests
+    fetch_sem = asyncio.Semaphore(10)
+
+    async def score_candidate(candidate):
+        async with fetch_sem:
+            trades = await data.get_trader_trades(candidate.address, limit=200)
+        sc = analyzer.score(candidate, trades)
         bot = detector.analyze(candidate.address, trades, candidate.profile)
-        score.raw_metrics["bot_signals"] = bot.signals
-        score.raw_metrics["bot_confidence"] = bot.bot_confidence
-        if score.composite_score >= settings.min_bot_score:
-            scored.append((score, bot))
+        sc.raw_metrics["bot_signals"] = bot.signals
+        sc.raw_metrics["bot_confidence"] = bot.bot_confidence
+        return sc, bot
+
+    results = await asyncio.gather(*[score_candidate(c) for c in candidates])
+    scored = [
+        (sc, bot) for sc, bot in results
+        if sc.composite_score >= settings.min_bot_score
+    ]
 
     log.info("%d wallets above min_bot_score=%d", len(scored), settings.min_bot_score)
 
-    # Ask Claude to rank (optional)
     if analyst and settings.has_claude_credentials and scored:
-        from .scanner.analyzer import WalletScore
         top_addresses = await analyst.evaluate_wallets(
             [s for s, _ in scored],
             max_select=settings.max_target_wallets,
         )
     else:
-        top_addresses = [s.address for s, _ in sorted(scored, key=lambda x: x[0].composite_score, reverse=True)][: settings.max_target_wallets]
+        top_addresses = [
+            s.address
+            for s, _ in sorted(scored, key=lambda x: x[0].composite_score, reverse=True)
+        ][: settings.max_target_wallets]
 
     log.info("Selected %d target wallets: %s", len(top_addresses), [a[:8] for a in top_addresses])
 
-    # Persist to DB
     async with session_factory() as session:
-        from sqlalchemy import select
-
-        # Deactivate all
-        all_wallets_result = await session.execute(select(Wallet))
-        for w in all_wallets_result.scalars().all():
+        all_result = await session.execute(select(Wallet))
+        for w in all_result.scalars().all():
             w.is_active = False
 
         for ws, bot in scored:
             existing = (
                 await session.execute(select(Wallet).where(Wallet.address == ws.address))
             ).scalar_one_or_none()
-
-            if existing:
-                w = existing
-            else:
-                w = Wallet(address=ws.address)
+            w = existing or Wallet(address=ws.address)
+            if not existing:
                 session.add(w)
-
             w.composite_score = ws.composite_score
             w.win_rate = ws.win_rate
             w.roi_30d = ws.roi_30d
@@ -263,11 +260,103 @@ async def _run_scan(
         session.add(scan_run)
         await session.commit()
 
-    # Update in-memory active set
-    copier.active_wallets.clear()
-    copier.active_wallets.update(top_addresses)
+    await copier.update_active_wallets(top_addresses)
     log.info("Scan complete. Monitoring %d wallets.", len(top_addresses))
 
+
+# ── Position manager loop ─────────────────────────────────────────────────────
+
+async def _position_manager_loop(
+    settings: Settings,
+    executor: BaseExecutor,
+    clob: ClobClient,
+    session_factory,
+) -> None:
+    log = logging.getLogger("agent.positions")
+    while True:
+        await asyncio.sleep(settings.price_update_interval)
+        try:
+            await _update_positions(settings, executor, clob, session_factory)
+        except Exception as exc:
+            log.error("Position manager error: %s", exc, exc_info=True)
+
+
+async def _update_positions(
+    settings: Settings,
+    executor: BaseExecutor,
+    clob: ClobClient,
+    session_factory,
+) -> None:
+    log = logging.getLogger("agent.positions")
+
+    async with session_factory() as session:
+        result = await session.execute(
+            select(Position).where(Position.status == "open")
+        )
+        positions: list[Position] = list(result.scalars().all())
+
+    if not positions:
+        return
+
+    # Fetch prices for all unique token IDs in parallel
+    unique_tokens = {p.token_id for p in positions if p.token_id}
+    price_map: dict[str, float] = {}
+
+    async def fetch_price(token_id: str) -> tuple[str, float]:
+        try:
+            book = await clob.get_order_book(token_id)
+            return token_id, book.mid_price
+        except Exception:
+            return token_id, 0.0
+
+    price_results = await asyncio.gather(*[fetch_price(t) for t in unique_tokens])
+    price_map = {tid: price for tid, price in price_results if price > 0}
+
+    now = datetime.now(timezone.utc)
+    closes: list[tuple[int, str]] = []
+
+    async with session_factory() as session:
+        for pos in positions:
+            current = price_map.get(pos.token_id, pos.current_price)
+            if current <= 0:
+                continue
+
+            pos_obj = await session.get(Position, pos.id)
+            if not pos_obj or pos_obj.status != "open":
+                continue
+
+            pos_obj.current_price = current
+            pos_obj.pnl = (current - pos_obj.entry_price) * (pos_obj.size_usdc / pos_obj.entry_price)
+            session.add(pos_obj)
+
+            # Check exit conditions
+            age_hours = 0.0
+            if pos_obj.opened_at:
+                opened = pos_obj.opened_at
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                age_hours = (now - opened).total_seconds() / 3600
+
+            pct_change = (current - pos_obj.entry_price) / pos_obj.entry_price if pos_obj.entry_price > 0 else 0
+
+            if pct_change >= settings.take_profit_pct:
+                closes.append((pos_obj.id, f"Take profit: +{pct_change:.1%}"))
+            elif pct_change <= -settings.stop_loss_pct:
+                closes.append((pos_obj.id, f"Stop loss: {pct_change:.1%}"))
+            elif age_hours >= settings.max_hold_hours:
+                closes.append((pos_obj.id, f"Max hold time reached: {age_hours:.0f}h"))
+
+        await session.commit()
+
+    # Execute closes outside the update session to avoid nested transactions
+    for pos_id, reason in closes:
+        log.info("Auto-closing pos #%d: %s", pos_id, reason)
+        result = await executor.close_position(pos_id, reason)
+        if not result.success:
+            log.warning("Auto-close failed for pos #%d: %s", pos_id, result.error)
+
+
+# ── Claude tool handlers ──────────────────────────────────────────────────────
 
 def _build_tool_handlers(
     clob: ClobClient,
@@ -275,7 +364,12 @@ def _build_tool_handlers(
     session_factory,
     settings: Settings,
 ) -> dict:
+    _COND_RE = _re.compile(r'^(0x)?[a-fA-F0-9]{40,66}$')
+    _TOKEN_RE = _re.compile(r'^\d+$|^[a-fA-F0-9]{40,66}$')
+
     async def get_market_details(condition_id: str) -> dict:
+        if not _COND_RE.match(condition_id):
+            return {"error": "Invalid condition_id format"}
         market = await gamma.get_market(condition_id)
         if not market:
             return {"error": "Market not found"}
@@ -289,6 +383,8 @@ def _build_tool_handlers(
         }
 
     async def get_order_book_snapshot(token_id: str) -> dict:
+        if not _TOKEN_RE.match(str(token_id)):
+            return {"error": "Invalid token_id format"}
         book = await clob.get_order_book(token_id)
         return {
             "token_id": token_id,
@@ -301,7 +397,6 @@ def _build_tool_handlers(
         }
 
     async def check_exposure() -> dict:
-        from .strategy.risk import RiskManager
         rm = RiskManager(settings, session_factory)
         snap = await rm.get_exposure_snapshot()
         return {

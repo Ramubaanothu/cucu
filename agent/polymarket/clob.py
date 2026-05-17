@@ -82,7 +82,8 @@ class ClobClient:
         self, creds: CLOBCredentials, method: str, path: str, body: str = ""
     ) -> dict[str, str]:
         ts = str(int(time.time() * 1000))
-        msg = ts + method.upper() + path + body
+        nonce = str(int(time.time() * 1_000_000))
+        msg = nonce + ts + method.upper() + path + body
         sig = hmac.new(
             creds.api_secret.encode(),
             msg.encode(),
@@ -91,6 +92,7 @@ class ClobClient:
         return {
             "POLY-API-KEY": creds.api_key,
             "POLY-TIMESTAMP": ts,
+            "POLY-NONCE": nonce,
             "POLY-SIGNATURE": sig,
             "POLY-PASSPHRASE": creds.api_passphrase,
         }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +11,9 @@ if TYPE_CHECKING:
     import anthropic
 
 from ..scanner.analyzer import WalletScore
+
+_CONDITION_ID_RE = re.compile(r'^(0x)?[a-fA-F0-9]{64}$')
+_TOKEN_ID_RE = re.compile(r'^\d+$|^[a-fA-F0-9]{64}$')
 
 log = logging.getLogger(__name__)
 

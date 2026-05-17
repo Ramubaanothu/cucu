@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 3
     target_wallets: str = ""  # comma-separated override
 
+    # Position management
+    take_profit_pct: float = 0.15     # close position at +15% price gain
+    stop_loss_pct: float = 0.10       # close position at -10% price drop
+    max_hold_hours: int = 48          # force-close positions older than this
+    price_update_interval: int = 60   # seconds between price refresh cycles
+
     # Internal
     agent_http_port: int = 8000
     log_level: str = "INFO"
