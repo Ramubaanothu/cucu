@@ -3,127 +3,117 @@ import path from "path";
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
-import { Config, Trade } from "./types";
-import { OrderBookStream, CLOBEvent } from "./orderbook";
+import axios from "axios";
+import { OnChainTrade } from "./types";
+import { OnChainWatcher } from "./onchain";
 import { WalletPoller, WalletWatcher } from "./watcher";
 
-const config: Config = {
-  agentUrl: `http://localhost:${process.env.AGENT_HTTP_PORT ?? "8000"}`,
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_SECONDS ?? "3") * 1000,
-  scanIntervalMs: parseInt(process.env.SCAN_INTERVAL_SECONDS ?? "3600") * 1000,
-  dataApiBase: "https://data-api.polymarket.com",
-  maxRetries: 3,
-};
+const AGENT_URL = `http://localhost:${process.env.AGENT_HTTP_PORT ?? "8000"}`;
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_SECONDS ?? "3") * 1000;
+const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_SECONDS ?? "3600") * 1000;
+
+// Default to Polygon public WS endpoint; replace with Alchemy/Infura for reliability
+const POLYGON_WS_RPC =
+  process.env.POLYGON_WS_RPC_URL ?? "wss://polygon-bor-rpc.publicnode.com";
 
 const poller = new WalletPoller();
-const watcher = new WalletWatcher(config.agentUrl);
-const stream = new OrderBookStream();
+const watcher = new WalletWatcher(AGENT_URL);
+const onchain = new OnChainWatcher(POLYGON_WS_RPC);
 
-const pollingIntervals = new Map<string, NodeJS.Timeout>();
+const pollingTimers = new Map<string, NodeJS.Timeout>();
 
-function startPollingWallet(address: string): void {
-  if (pollingIntervals.has(address)) return;
+// ── Polling management ───────────────────────────────────────────────────────
+
+function startPolling(address: string): void {
+  if (pollingTimers.has(address)) return;
   const timer = setInterval(async () => {
-    const newTrades = await poller.pollWallet(address);
-    for (const trade of newTrades) {
-      await watcher.forwardSignal(trade, "poll");
-    }
-  }, config.pollIntervalMs);
-  pollingIntervals.set(address, timer);
+    const trades = await poller.pollWallet(address);
+    for (const t of trades) await watcher.forwardPollTrade(t);
+  }, POLL_INTERVAL_MS);
+  pollingTimers.set(address, timer);
 }
 
-function stopPollingWallet(address: string): void {
-  const timer = pollingIntervals.get(address);
-  if (timer) {
-    clearInterval(timer);
-    pollingIntervals.delete(address);
-  }
+function stopPolling(address: string): void {
+  const t = pollingTimers.get(address);
+  if (t) { clearInterval(t); pollingTimers.delete(address); }
 }
+
+// ── Target sync ──────────────────────────────────────────────────────────────
 
 async function syncTargets(): Promise<void> {
-  const prevTargets = new Set(pollingIntervals.keys());
-  const newTargets = await watcher.loadTargets();
+  const prev = new Set(pollingTimers.keys());
+  const next = await watcher.loadTargets();
 
-  if (newTargets.length === 0) {
-    console.warn(
-      "[Monitor] No active target wallets. Run a scan via: curl -X POST localhost:8000/rescan"
-    );
+  if (next.length === 0) {
+    console.warn("[Monitor] No active wallets. POST /rescan to the Python agent.");
+    return;
   }
 
-  const newSet = new Set(newTargets);
+  const nextSet = new Set(next);
 
-  // Stop polling wallets no longer in target list
-  for (const addr of prevTargets) {
-    if (!newSet.has(addr)) {
-      stopPollingWallet(addr);
-      console.log(`[Monitor] Stopped watching ${addr.slice(0, 10)}`);
-    }
+  for (const addr of prev) {
+    if (!nextSet.has(addr)) { stopPolling(addr); console.log(`[Monitor] Dropped ${addr.slice(0, 10)}`); }
+  }
+  for (const addr of next) {
+    if (!prev.has(addr)) { startPolling(addr); console.log(`[Monitor] Watching ${addr.slice(0, 10)}`); }
   }
 
-  // Start polling new targets
-  for (const addr of newTargets) {
-    if (!prevTargets.has(addr)) {
-      startPollingWallet(addr);
-      console.log(`[Monitor] Now watching ${addr.slice(0, 10)}`);
-    }
-  }
+  // Update on-chain filter with current target list
+  onchain.updateTargets(next);
+  console.log(`[Monitor] Synced — ${next.length} wallets (on-chain + polling)`);
 }
 
-// WS stream events — supplementary signal for order book depth changes
-stream.on("event", (event: CLOBEvent) => {
-  // The CLOB WS stream doesn't expose maker addresses directly,
-  // but we log significant price movements for awareness
-  if (event.event_type === "last_trade_price" && event.price) {
-    // No action needed — polling handles copy signals
-  }
+// ── On-chain event handler ───────────────────────────────────────────────────
+
+onchain.on("trade", async (trade: OnChainTrade) => {
+  await watcher.forwardOnChainTrade(trade);
 });
 
-async function main(): Promise<void> {
-  console.log(`[Monitor] Starting Polymarket wallet watcher`);
-  console.log(`[Monitor] Agent URL: ${config.agentUrl}`);
-  console.log(`[Monitor] Poll interval: ${config.pollIntervalMs}ms`);
+// ── Main ─────────────────────────────────────────────────────────────────────
 
-  // Wait for the Python agent to be ready
-  let agentReady = false;
-  for (let i = 0; i < 20; i++) {
+async function waitForAgent(): Promise<void> {
+  for (let i = 1; i <= 20; i++) {
     try {
-      const axios = (await import("axios")).default;
-      await axios.get(`${config.agentUrl}/status`, { timeout: 2000 });
-      agentReady = true;
-      break;
+      await axios.get(`${AGENT_URL}/status`, { timeout: 2_000 });
+      return;
     } catch {
-      console.log(`[Monitor] Waiting for agent (attempt ${i + 1}/20)…`);
-      await new Promise((r) => setTimeout(r, 2000));
+      console.log(`[Monitor] Waiting for Python agent (${i}/20)…`);
+      await new Promise((r) => setTimeout(r, 2_000));
     }
   }
+  throw new Error("Python agent not reachable after 40s");
+}
 
-  if (!agentReady) {
-    console.error("[Monitor] Agent not reachable. Start the Python agent first.");
-    process.exit(1);
-  }
+async function main(): Promise<void> {
+  console.log("[Monitor] Starting cucu monitor");
+  console.log(`[Monitor] Agent:    ${AGENT_URL}`);
+  console.log(`[Monitor] RPC:      ${POLYGON_WS_RPC}`);
+  console.log(`[Monitor] Poll:     ${POLL_INTERVAL_MS}ms (fallback)`);
 
-  // Initial target load
+  await waitForAgent();
   await syncTargets();
 
-  // Connect to CLOB WebSocket (supplementary)
-  stream.connect();
+  // Primary: on-chain subscription
+  onchain.connect();
 
-  // Refresh target list on scan interval
-  setInterval(() => syncTargets(), config.scanIntervalMs);
+  // Refresh target list periodically (after each scanner run)
+  setInterval(syncTargets, SCAN_INTERVAL_MS);
 
   console.log(
-    `[Monitor] Watching ${pollingIntervals.size} wallets. Press Ctrl+C to stop.`
+    `[Monitor] Running — ${pollingTimers.size} wallets.\n` +
+    `          On-chain (primary): Polygon WS → ~2-4s latency\n` +
+    `          Polling (fallback):  REST API  → ~${POLL_INTERVAL_MS / 1000}s latency`
   );
 }
 
 process.on("SIGINT", () => {
   console.log("\n[Monitor] Shutting down…");
-  for (const addr of pollingIntervals.keys()) stopPollingWallet(addr);
-  stream.destroy();
+  for (const a of pollingTimers.keys()) stopPolling(a);
+  onchain.destroy();
   process.exit(0);
 });
 
 main().catch((err) => {
-  console.error("[Monitor] Fatal error:", err);
+  console.error("[Monitor] Fatal:", err);
   process.exit(1);
 });

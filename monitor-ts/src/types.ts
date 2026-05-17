@@ -6,7 +6,7 @@ export interface CopySignal {
   order_size_usdc: number;
   price: number;
   detected_at: string;
-  detection_method: "poll" | "ws";
+  detection_method: "poll" | "onchain";
 }
 
 export interface Trade {
@@ -33,6 +33,17 @@ export interface Config {
   agentUrl: string;
   pollIntervalMs: number;
   scanIntervalMs: number;
-  dataApiBase: string;
+  polygonWsRpcUrl: string;
   maxRetries: number;
+}
+
+export interface OnChainTrade {
+  maker: string;
+  tokenId: string;       // ERC1155 outcome token ID
+  sizeUsdc: number;      // USDC amount (human units)
+  price: number;         // 0.0 – 1.0
+  side: "YES" | "NO";
+  txHash: string;
+  blockNumber: number;
+  detectedAt: string;
 }
