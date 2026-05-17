@@ -59,6 +59,12 @@ class RisingStarAnalyzer(WalletAnalyzer):
     MIN_TRADE_COUNT = 10
 
 
+class HotWalletAnalyzer(WalletAnalyzer):
+    """Ultra-low threshold for wallets flagged by real-time hot-wallet detection.
+    Even 3 trades is enough if the pattern looks strong."""
+    MIN_TRADE_COUNT = 3
+
+
 class OnChainScanner:
     """
     Scans the CTF Exchange for active traders not yet visible on the leaderboard.

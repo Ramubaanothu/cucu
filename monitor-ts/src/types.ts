@@ -47,3 +47,27 @@ export interface OnChainTrade {
   blockNumber: number;
   detectedAt: string;
 }
+
+// Emitted for every maker (not just known targets) — used by HotWalletTracker
+export interface OnChainActivity {
+  maker: string;
+  tokenId: string;
+  sizeUsdc: number;
+  price: number;
+  isBuy: boolean;        // true = maker gave USDC, false = maker gave outcome token
+  txHash: string;
+  blockNumber: number;
+  detectedAt: string;
+}
+
+// Forwarded to Python /hot-wallet when a wallet crosses alert thresholds
+export interface HotWalletAlert {
+  address: string;
+  trade_count: number;
+  window_hours: number;
+  buy_usdc: number;
+  sell_usdc: number;
+  profit_ratio: number;
+  unique_markets: number;
+  reason: string;
+}

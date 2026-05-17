@@ -29,7 +29,7 @@
 import { EventEmitter } from "events";
 import { ethers } from "ethers";
 import WebSocket from "ws";
-import { OnChainTrade } from "./types";
+import { OnChainActivity, OnChainTrade } from "./types";
 
 // Polymarket CTF Exchange on Polygon mainnet
 const CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".toLowerCase();
@@ -154,9 +154,6 @@ export class OnChainWatcher extends EventEmitter {
 
       const maker: string = (decoded.args.maker as string).toLowerCase();
 
-      // Only process events from our target wallets
-      if (!this.targetWallets.has(maker)) return;
-
       const makerAssetId: bigint = decoded.args.makerAssetId as bigint;
       const takerAssetId: bigint = decoded.args.takerAssetId as bigint;
       const makerAmount: bigint = decoded.args.makerAmountFilled as bigint;
@@ -166,6 +163,7 @@ export class OnChainWatcher extends EventEmitter {
       let tokenId: string;
       let sizeUsdc: number;
       let price: number;
+      let isBuy: boolean;
       let side: "YES" | "NO";
 
       if (makerAssetId === COLLATERAL_ASSET_ID) {
@@ -173,14 +171,15 @@ export class OnChainWatcher extends EventEmitter {
         tokenId = takerAssetId.toString();
         sizeUsdc = Number(makerAmount) / 1e6;
         price = takerAmount > 0n ? Number(makerAmount) / Number(takerAmount) : 0;
-        // Outcome token side determined during enrichment; default YES
+        isBuy = true;
         side = "YES";
       } else if (takerAssetId === COLLATERAL_ASSET_ID) {
         // Maker gives outcome token → SELLING
         tokenId = makerAssetId.toString();
         sizeUsdc = Number(takerAmount) / 1e6;
         price = makerAmount > 0n ? Number(takerAmount) / Number(makerAmount) : 0;
-        side = "NO"; // selling YES = effectively NO signal; enrichment corrects this
+        isBuy = false;
+        side = "NO";
       } else {
         // Neither is collateral — token-to-token swap, skip
         return;
@@ -189,16 +188,16 @@ export class OnChainWatcher extends EventEmitter {
       // Sanity check: price must be 0–1
       if (price <= 0 || price >= 1 || sizeUsdc < 0.5) return;
 
-      const trade: OnChainTrade = {
-        maker,
-        tokenId,
-        sizeUsdc,
-        price,
-        side,
-        txHash,
-        blockNumber,
-        detectedAt: new Date().toISOString(),
-      };
+      const detectedAt = new Date().toISOString();
+
+      // Emit activity for ALL makers — used by HotWalletTracker regardless of target list
+      const activity: OnChainActivity = { maker, tokenId, sizeUsdc, price, isBuy, txHash, blockNumber, detectedAt };
+      this.emit("activity", activity);
+
+      // Only forward a full trade signal for known target wallets
+      if (!this.targetWallets.has(maker)) return;
+
+      const trade: OnChainTrade = { maker, tokenId, sizeUsdc, price, side, txHash, blockNumber, detectedAt };
 
       console.log(
         `[OnChain] Detected trade: ${maker.slice(0, 10)} token=${tokenId.slice(0, 12)} $${sizeUsdc.toFixed(2)} @ ${price.toFixed(3)} tx=${txHash.slice(0, 12)}`

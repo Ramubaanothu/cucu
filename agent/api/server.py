@@ -4,12 +4,17 @@ import asyncio
 import hashlib
 import logging
 import time
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from ..db.models import Position, TradeLog, Wallet
+from ..polymarket.data import DataClient
+from ..scanner.detector import BotDetector
+from ..scanner.leaderboard import WalletCandidate
+from ..scanner.onchain_scanner import HotWalletAnalyzer
 from ..strategy.copier import CopySignal, CopyTrader
 from ..strategy.risk import RiskManager
 
@@ -50,6 +55,7 @@ def build_app(
     copier: CopyTrader,
     risk: RiskManager,
     session_factory,
+    data_client: DataClient | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Polymarket Copy-Trading Agent", version="0.1.0")
 
@@ -179,6 +185,113 @@ def build_app(
         )
         asyncio.create_task(copier.handle_signal(signal))
         return {"status": "queued"}
+
+    # ── Hot-wallet real-time intake ──────────────────────────────────────────────
+
+    class HotWalletPayload(BaseModel):
+        address: str
+        trade_count: int
+        window_hours: float
+        buy_usdc: float
+        sell_usdc: float
+        profit_ratio: float
+        unique_markets: int
+        reason: str
+
+    # Cooldown: skip re-evaluation if we just processed this wallet
+    _hot_wallet_seen: dict[str, float] = {}
+    _HOT_WALLET_COOLDOWN = 3600.0  # 1 hour
+
+    @app.post("/hot-wallet")
+    async def receive_hot_wallet(payload: HotWalletPayload) -> dict:
+        address = payload.address.lower()
+        now = time.monotonic()
+
+        # Already watching?
+        async with copier._wallets_lock:
+            if address in copier.active_wallets:
+                return {"status": "already_watching", "address": address}
+
+        # Evaluation cooldown — avoid hammering Data API for the same wallet
+        last_seen = _hot_wallet_seen.get(address, 0.0)
+        if now - last_seen < _HOT_WALLET_COOLDOWN:
+            return {"status": "cooldown", "address": address}
+        _hot_wallet_seen[address] = now
+
+        log.info(
+            "[HotWallet] Alert from monitor: %s — %s (buy=$%.0f sell=$%.0f ratio=%.1fx)",
+            address[:10], payload.reason, payload.buy_usdc, payload.sell_usdc, payload.profit_ratio,
+        )
+
+        if data_client is None:
+            return {"status": "no_data_client"}
+
+        # Fetch trade history and score immediately
+        trades, profile = await asyncio.gather(
+            data_client.get_trader_trades(address, limit=100),
+            data_client.get_trader_profile(address),
+        )
+
+        candidate = WalletCandidate(
+            address=address,
+            entry_1m=None,
+            entry_1w=None,
+            profile=profile,
+        )
+        analyzer = HotWalletAnalyzer()
+        detector = BotDetector()
+
+        score = analyzer.score(candidate, trades)
+        bot   = detector.analyze(address, trades, profile)
+
+        log.info(
+            "[HotWallet] %s scored %.1f (win_rate=%.0f%% trades=%d bot=%s)",
+            address[:10], score.composite_score,
+            score.win_rate * 100, score.trade_count, bot.is_bot_likely,
+        )
+
+        # Threshold: lower than normal (40) — on-chain pattern already a strong signal
+        HOT_WALLET_MIN_SCORE = 40.0
+        if score.composite_score < HOT_WALLET_MIN_SCORE and not bot.is_bot_likely:
+            return {
+                "status": "rejected",
+                "address": address,
+                "score": score.composite_score,
+                "reason": f"score {score.composite_score:.1f} < {HOT_WALLET_MIN_SCORE} and not bot-like",
+            }
+
+        added = await copier.add_wallet(address)
+
+        # Persist to DB so the wallet appears in /wallets and survives restart
+        async with session_factory() as session:
+            existing = (
+                await session.execute(select(Wallet).where(Wallet.address == address))
+            ).scalar_one_or_none()
+            w = existing or Wallet(address=address)
+            if not existing:
+                session.add(w)
+            w.composite_score = score.composite_score
+            w.win_rate        = score.win_rate
+            w.roi_30d         = score.roi_30d
+            w.sharpe          = score.sharpe
+            w.trade_count     = score.trade_count
+            w.is_bot_likely   = bot.is_bot_likely
+            w.bot_confidence  = bot.bot_confidence
+            w.is_active       = True
+            w.last_scanned_at = datetime.utcnow()
+            await session.commit()
+
+        status = "activated" if added else "already_active"
+        log.info("[HotWallet] %s %s (score=%.1f bot=%s)", address[:10], status, score.composite_score, bot.is_bot_likely)
+        return {
+            "status": status,
+            "address": address,
+            "score": score.composite_score,
+            "win_rate": round(score.win_rate, 3),
+            "trade_count": score.trade_count,
+            "is_bot_likely": bot.is_bot_likely,
+            "trigger_reason": payload.reason,
+        }
 
     @app.post("/rescan")
     async def trigger_rescan() -> dict:

@@ -4,8 +4,9 @@ import path from "path";
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 import axios from "axios";
-import { OnChainTrade } from "./types";
+import { HotWalletAlert, OnChainActivity, OnChainTrade } from "./types";
 import { OnChainWatcher } from "./onchain";
+import { HotWalletTracker } from "./hot_tracker";
 import { WalletPoller, WalletWatcher } from "./watcher";
 
 const AGENT_URL = `http://localhost:${process.env.AGENT_HTTP_PORT ?? "8000"}`;
@@ -19,6 +20,7 @@ const POLYGON_WS_RPC =
 const poller = new WalletPoller();
 const watcher = new WalletWatcher(AGENT_URL);
 const onchain = new OnChainWatcher(POLYGON_WS_RPC);
+const hotTracker = new HotWalletTracker();
 
 const pollingTimers = new Map<string, NodeJS.Timeout>();
 
@@ -63,10 +65,31 @@ async function syncTargets(): Promise<void> {
   console.log(`[Monitor] Synced — ${next.length} wallets (on-chain + polling)`);
 }
 
-// ── On-chain event handler ───────────────────────────────────────────────────
+// ── On-chain event handlers ──────────────────────────────────────────────────
 
+// Copy-signal path: known target wallets only
 onchain.on("trade", async (trade: OnChainTrade) => {
   await watcher.forwardOnChainTrade(trade);
+});
+
+// Hot-wallet discovery: track ALL makers in real time
+onchain.on("activity", (activity: OnChainActivity) => {
+  hotTracker.track(activity.maker, activity.sizeUsdc, activity.isBuy, activity.tokenId);
+});
+
+// Forward hot-wallet alerts to Python for immediate scoring and activation
+hotTracker.on("hot-wallet", async (alert: HotWalletAlert) => {
+  try {
+    const resp = await axios.post(`${AGENT_URL}/hot-wallet`, alert, { timeout: 10_000 });
+    const { status, score } = resp.data as { status: string; score?: number };
+    console.log(
+      `[HotTracker] Agent response for ${alert.address.slice(0, 10)}: ${status}` +
+      (score !== undefined ? ` (score=${score.toFixed(1)})` : "")
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[HotTracker] Failed to forward alert: ${msg}`);
+  }
 });
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -110,6 +133,7 @@ process.on("SIGINT", () => {
   console.log("\n[Monitor] Shutting down…");
   for (const a of pollingTimers.keys()) stopPolling(a);
   onchain.destroy();
+  hotTracker.destroy();
   process.exit(0);
 });
 

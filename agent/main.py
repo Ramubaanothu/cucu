@@ -132,7 +132,7 @@ async def _main(
         active_wallets=active_wallets,
     )
 
-    app = build_app(copier, risk, session_factory)
+    app = build_app(copier, risk, session_factory, data_client=data)
     server_config = uvicorn.Config(
         app,
         host="0.0.0.0",

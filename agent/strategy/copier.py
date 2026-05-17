@@ -55,6 +55,15 @@ class CopyTrader:
             self.active_wallets.clear()
             self.active_wallets.update(new_wallets)
 
+    async def add_wallet(self, address: str) -> bool:
+        """Add a single wallet without replacing the existing set. Returns True if newly added."""
+        addr = address.lower()
+        async with self._wallets_lock:
+            if addr in self.active_wallets:
+                return False
+            self.active_wallets.add(addr)
+            return True
+
     async def handle_signal(self, signal: CopySignal) -> None:
         wallet = signal.source_wallet.lower()
 
