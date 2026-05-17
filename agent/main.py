@@ -26,6 +26,7 @@ from .polymarket.gamma import GammaClient
 from .scanner.analyzer import WalletAnalyzer
 from .scanner.detector import BotDetector
 from .scanner.leaderboard import LeaderboardFetcher
+from .scanner.onchain_scanner import OnChainScanner, RisingStarAnalyzer
 from .strategy.copier import CopyTrader
 from .strategy.risk import RiskManager
 
@@ -143,9 +144,14 @@ async def _main(
     log.info("HTTP API listening on port %d", settings.agent_http_port)
     log.info("TypeScript monitor: cd monitor-ts && npm start")
 
+    on_chain_scanner = OnChainScanner(
+        rpc_url=settings.polygon_rpc_url,
+        data_client=data,
+    )
+
     await asyncio.gather(
         server.serve(),
-        _scan_loop(settings, data, analyst, session_factory, copier, scan_now),
+        _scan_loop(settings, data, analyst, session_factory, copier, scan_now, on_chain_scanner),
         _position_manager_loop(settings, executor, clob, session_factory),
     )
 
@@ -159,6 +165,7 @@ async def _scan_loop(
     session_factory,
     copier: CopyTrader,
     run_immediately: bool,
+    on_chain_scanner: OnChainScanner,
 ) -> None:
     log = logging.getLogger("agent.scanner")
 
@@ -171,10 +178,16 @@ async def _scan_loop(
 
     while True:
         try:
-            await _run_scan(settings, data, analyst, session_factory, copier)
+            await _run_scan(settings, data, analyst, session_factory, copier, on_chain_scanner)
         except Exception as exc:
             log.error("Scan failed: %s", exc, exc_info=True)
         await asyncio.sleep(settings.scan_interval_seconds)
+
+
+# Rising stars use a lower composite score floor — more risk, smaller allocation
+_RISING_STAR_MIN_SCORE = 50
+# At most this many rising-star slots in the final watch list
+_RISING_STAR_MAX_SLOTS = 3
 
 
 async def _run_scan(
@@ -183,12 +196,14 @@ async def _run_scan(
     analyst: AIAnalyst | None,
     session_factory,
     copier: CopyTrader,
+    on_chain_scanner: OnChainScanner,
 ) -> None:
     log = logging.getLogger("agent.scanner")
     log.info("Starting leaderboard scan…")
 
     fetcher = LeaderboardFetcher(data)
     analyzer = WalletAnalyzer()
+    rising_analyzer = RisingStarAnalyzer()
     detector = BotDetector()
 
     candidates = await fetcher.fetch_candidates(top_n=200)
@@ -204,6 +219,7 @@ async def _run_scan(
         bot = detector.analyze(candidate.address, trades, candidate.profile)
         sc.raw_metrics["bot_signals"] = bot.signals
         sc.raw_metrics["bot_confidence"] = bot.bot_confidence
+        sc.raw_metrics["source"] = "leaderboard"
         return sc, bot
 
     results = await asyncio.gather(*[score_candidate(c) for c in candidates])
@@ -214,6 +230,49 @@ async def _run_scan(
 
     log.info("%d wallets above min_bot_score=%d", len(scored), settings.min_bot_score)
 
+    # ── On-chain rising-star discovery ────────────────────────────────────────────
+    known_addresses = {c.address for c in candidates}
+    rising_count = 0
+    try:
+        rising_candidates = await on_chain_scanner.scan_new_traders(
+            known_addresses=known_addresses,
+            max_results=50,
+        )
+        log.info("[OnChainScanner] Scoring %d rising-star candidates…", len(rising_candidates))
+
+        async def score_rising(candidate):
+            async with fetch_sem:
+                trades = await data.get_trader_trades(candidate.address, limit=200)
+            sc = rising_analyzer.score(candidate, trades)
+            bot = detector.analyze(candidate.address, trades, candidate.profile)
+            sc.raw_metrics["bot_signals"] = bot.signals
+            sc.raw_metrics["bot_confidence"] = bot.bot_confidence
+            sc.raw_metrics["source"] = "onchain"
+            return sc, bot
+
+        rising_results = await asyncio.gather(*[score_rising(c) for c in rising_candidates])
+        rising_scored = sorted(
+            [
+                (sc, bot) for sc, bot in rising_results
+                if sc.composite_score >= _RISING_STAR_MIN_SCORE
+            ],
+            key=lambda x: x[0].composite_score,
+            reverse=True,
+        )[:_RISING_STAR_MAX_SLOTS]
+
+        rising_count = len(rising_candidates)
+        if rising_scored:
+            log.info(
+                "[OnChainScanner] %d rising stars qualify (score >= %d): %s",
+                len(rising_scored),
+                _RISING_STAR_MIN_SCORE,
+                [s.address[:8] for s, _ in rising_scored],
+            )
+            scored = list(scored) + rising_scored
+    except Exception as exc:
+        log.warning("[OnChainScanner] Rising-star scan failed (continuing without): %s", exc)
+
+    # ── Wallet selection ──────────────────────────────────────────────────────────
     if analyst and settings.has_claude_credentials and scored:
         top_addresses = await analyst.evaluate_wallets(
             [s for s, _ in scored],
@@ -253,7 +312,7 @@ async def _run_scan(
 
         scan_run = ScanRun(
             completed_at=datetime.utcnow(),
-            wallets_found=len(candidates),
+            wallets_found=len(candidates) + rising_count,
             wallets_selected=len(top_addresses),
         )
         scan_run.set_addresses(top_addresses)
