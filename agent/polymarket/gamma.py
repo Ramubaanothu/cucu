@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from ..http_client import make_client
+
 
 BASE_URL = "https://gamma-api.polymarket.com"
 _TIMEOUT = 30.0
@@ -55,7 +57,7 @@ class MarketMeta:
 
 class GammaClient:
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(
+        self._client = make_client(
             base_url=BASE_URL,
             timeout=_TIMEOUT,
             headers={"Accept": "application/json"},

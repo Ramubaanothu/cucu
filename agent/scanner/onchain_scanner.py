@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from ..http_client import make_client
 from ..polymarket.data import DataClient
 from .analyzer import WalletAnalyzer
 from .leaderboard import WalletCandidate
@@ -83,7 +84,7 @@ class OnChainScanner:
         self._data = data_client
         self._lookback_days = lookback_days
         self._min_trades = min_trades
-        self._http = httpx.AsyncClient(timeout=30.0)
+        self._http = make_client(timeout=30.0)
 
     async def aclose(self) -> None:
         await self._http.aclose()
