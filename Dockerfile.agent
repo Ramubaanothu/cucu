@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for eth-account / cryptography
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libssl-dev libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir -e .
+
+COPY agent/ ./agent/
+
+# Data directory is volume-mounted at runtime
+RUN mkdir -p /app/data
+
+CMD ["cucu", "run", "--mode", "paper"]
